@@ -3,7 +3,7 @@ import asyncio
 import random
 import string
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Set, Optional, Tuple
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -12,12 +12,15 @@ from aiogram.types import (
     BotCommand,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    BufferedInputFile,
+    InputMediaPhoto,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from aiohttp import web
+from PIL import Image, ImageDraw
 
 
 # ===================== SETTINGS =====================
@@ -34,7 +37,6 @@ BOT: Optional[Bot] = None
 # ===================== BUTTON TEXTS =====================
 BTN_CREATE = "➕ Создать комнату"
 BTN_JOIN = "🔑 Войти по коду"
-
 BTN_LEAVE = "🚪 Выйти из комнаты"
 
 BTN_LIVES = "❤️ Жизни"
@@ -42,6 +44,12 @@ BTN_SETWORD = "🪓 Новое слово"
 BTN_START = "🚀 Старт игры"
 BTN_RESTART = "🔄 Новая игра"
 BTN_CLOSE = "🧹 Закрыть комнату"
+
+BTN_KICK = "👢 Удалить игрока"
+BTN_TRANSFER = "👑 Выбрать другого хоста"
+
+BTN_COMMENT = "💬 Комментарий"
+BTN_CANCEL = "❌ Отмена"
 
 
 # ===================== UI KEYBOARDS =====================
@@ -54,7 +62,10 @@ def kb_main() -> ReplyKeyboardMarkup:
 
 def kb_player_room() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN_LEAVE)]],
+        keyboard=[
+            [KeyboardButton(text=BTN_COMMENT)],
+            [KeyboardButton(text=BTN_LEAVE)],
+        ],
         resize_keyboard=True,
     )
 
@@ -64,9 +75,18 @@ def kb_host_room() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_LIVES), KeyboardButton(text=BTN_SETWORD)],
             [KeyboardButton(text=BTN_START), KeyboardButton(text=BTN_RESTART)],
+            [KeyboardButton(text=BTN_KICK), KeyboardButton(text=BTN_TRANSFER)],
             [KeyboardButton(text=BTN_CLOSE)],
+            [KeyboardButton(text=BTN_COMMENT)],
             [KeyboardButton(text=BTN_LEAVE)],
         ],
+        resize_keyboard=True,
+    )
+
+
+def kb_cancel_only() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BTN_CANCEL)]],
         resize_keyboard=True,
     )
 
@@ -81,74 +101,19 @@ class HostSetup(StatesGroup):
     waiting_word = State()
 
 
-class SetWordFlow(StatesGroup):
-    waiting_word = State()
+class KickFlow(StatesGroup):
+    waiting_index = State()
 
 
-class LivesFlow(StatesGroup):
-    waiting_lives = State()
+class TransferFlow(StatesGroup):
+    waiting_index = State()
+
+
+class CommentFlow(StatesGroup):
+    waiting_text = State()
 
 
 # ===================== GAME DATA =====================
-HANGMAN_PICS = [
-    r"""
- +---+
- |   |
-     |
-     |
-     |
-     |
-=========""",
-    r"""
- +---+
- |   |
- O   |
-     |
-     |
-     |
-=========""",
-    r"""
- +---+
- |   |
- O   |
- |   |
-     |
-     |
-=========""",
-    r"""
- +---+
- |   |
- O   |
-/|   |
-     |
-     |
-=========""",
-    r"""
- +---+
- |   |
- O   |
-/|\  |
-     |
-     |
-=========""",
-    r"""
- +---+
- |   |
- O   |
-/|\  |
-/    |
-     |
-=========""",
-    r"""
- +---+
- |   |
- O   |
-/|\  |
-/ \  |
-     |
-=========""",
-]
-
 ALLOWED = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюя-")
 
 
@@ -158,6 +123,13 @@ def gen_code(n: int = 5) -> str:
 
 def tg_name(m: Message) -> str:
     return (m.from_user.first_name or m.from_user.full_name or "Игрок").strip()
+
+
+def tg_tag(m: Message) -> str:
+    u = m.from_user
+    if u and u.username:
+        return f"@{u.username}"
+    return tg_name(m)
 
 
 def normalize_word(w: str) -> str:
@@ -170,8 +142,9 @@ class Room:
     code: str
     host_id: int
     players: Set[int] = field(default_factory=set)
-    order: List[int] = field(default_factory=list)      # отгадывающие (без хоста)
-    names: Dict[int, str] = field(default_factory=dict) # user_id -> имя
+    order: List[int] = field(default_factory=list)       # отгадывающие (без хоста)
+    names: Dict[int, str] = field(default_factory=dict)
+    tags: Dict[int, str] = field(default_factory=dict)
 
     started: bool = False
     max_fails: int = 6
@@ -180,8 +153,10 @@ class Room:
     fails: int = 0
     turn_idx: int = 0
 
-    status_msg_id: Dict[int, int] = field(default_factory=dict)
+    status_msg_id: Dict[int, int] = field(default_factory=dict)  # uid -> message_id
     last_move: str = ""
+
+    img_cache: Dict[Tuple[int, int], bytes] = field(default_factory=dict)
 
 
 rooms_by_code: Dict[str, Room] = {}
@@ -196,28 +171,11 @@ def get_room_by_user(uid: int) -> Optional[Room]:
     return rooms_by_code.get(code)
 
 
-def is_host(uid: int) -> bool:
-    room = get_room_by_user(uid)
-    return bool(room and room.host_id == uid)
-
-
 def ui_for(uid: int) -> ReplyKeyboardMarkup:
     room = get_room_by_user(uid)
     if not room:
         return kb_main()
     return kb_host_room() if room.host_id == uid else kb_player_room()
-
-
-def display_name(room: Room, uid: int) -> str:
-    return room.names.get(uid) or "Игрок"
-
-
-def hang_pic(fails: int) -> str:
-    return HANGMAN_PICS[min(fails, len(HANGMAN_PICS) - 1)]
-
-
-def shown_word(secret: str, guessed: Set[str]) -> str:
-    return " ".join([ch if ch in guessed else "•" for ch in secret])
 
 
 def current_turn_user(room: Room) -> int:
@@ -226,24 +184,21 @@ def current_turn_user(room: Room) -> int:
     return room.order[room.turn_idx % len(room.order)]
 
 
+def shown_word(secret: str, guessed: Set[str]) -> str:
+    return " ".join([ch if ch in guessed else "•" for ch in secret])
+
+
 def game_status_text(room: Room) -> str:
     lives_left = max(0, room.max_fails - room.fails)
 
     header = f"🎮 Комната: {room.code}\n👥 Игроков: {len(room.players)}\n❤️ Жизни: {lives_left}/{room.max_fails}\n"
-    pic = hang_pic(room.fails)
-
-    if room.secret:
-        word_line = f"🪓 Слово: {shown_word(room.secret, room.guessed)}\n"
-    else:
-        word_line = "🪓 Слово: (хост ещё не загадал)\n"
-
+    word_line = f"🪓 Слово: {shown_word(room.secret, room.guessed)}\n" if room.secret else "🪓 Слово: (хост ещё не загадал)\n"
     guessed_line = "🔤 Буквы: " + (", ".join(sorted(room.guessed)) if room.guessed else "-") + "\n"
-
     move_line = f"\n✍️ Последний ход: {room.last_move}\n" if room.last_move else ""
 
     if room.started and room.order:
         tu = current_turn_user(room)
-        turn_line = f"\n➡️ Сейчас ходит: {display_name(room, tu)}\n(пиши букву или слово целиком)"
+        turn_line = f"\n➡️ Сейчас ходит: {room.tags.get(tu, room.names.get(tu, 'Игрок'))}\n(пиши букву или слово целиком)"
     elif room.started and not room.order:
         turn_line = "\n⚠️ Некому ходить (кроме хоста). Пусть друг войдёт по коду."
     else:
@@ -254,42 +209,101 @@ def game_status_text(room: Room) -> str:
         else:
             turn_line = "\n⏸ Хост: задай жизни и слово."
 
-    return header + pic + "\n\n" + word_line + guessed_line + move_line + turn_line
+    return header + word_line + guessed_line + move_line + turn_line
 
 
-async def upsert_status(room: Room, uid: int):
+# ===================== IMAGE (PIL) =====================
+def _draw_hangman_png(stage: int) -> bytes:
+    W, H = 700, 420
+    img = Image.new("RGB", (W, H), "white")
+    d = ImageDraw.Draw(img)
+
+    d.line((80, 380, 320, 380), fill="black", width=6)
+    d.line((140, 380, 140, 70), fill="black", width=8)
+    d.line((140, 70, 360, 70), fill="black", width=8)
+    d.line((360, 70, 360, 110), fill="black", width=6)
+
+    if stage >= 1:
+        d.ellipse((330, 110, 390, 170), outline="black", width=6)
+    if stage >= 2:
+        d.line((360, 170, 360, 260), fill="black", width=6)
+    if stage >= 3:
+        d.line((360, 200, 310, 235), fill="black", width=6)
+    if stage >= 4:
+        d.line((360, 200, 410, 235), fill="black", width=6)
+    if stage >= 5:
+        d.line((360, 260, 320, 330), fill="black", width=6)
+    if stage >= 6:
+        d.line((360, 260, 400, 330), fill="black", width=6)
+
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def hangman_image(room: Room) -> bytes:
+    key = (room.max_fails, room.fails)
+    if key in room.img_cache:
+        return room.img_cache[key]
+
+    if room.max_fails <= 0:
+        stage = 6
+    else:
+        stage = int(round((room.fails / room.max_fails) * 6))
+        stage = max(0, min(6, stage))
+
+    data = _draw_hangman_png(stage)
+    room.img_cache[key] = data
+    return data
+
+
+# ===================== STATUS MESSAGE (ONE, BUT CAN "BUMP") =====================
+async def upsert_status(room: Room, uid: int, force_new: bool = False):
     global BOT
     if not BOT:
         return
 
-    text = game_status_text(room)
+    caption = game_status_text(room)
     kb = ui_for(uid)
     mid = room.status_msg_id.get(uid)
 
+    png = hangman_image(room)
+    file = BufferedInputFile(png, filename="hangman.png")
+
+    # чтобы статус был последним: удаляем старый и шлём новый
+    if force_new and mid:
+        try:
+            await BOT.delete_message(chat_id=uid, message_id=mid)
+        except Exception:
+            pass
+        room.status_msg_id.pop(uid, None)
+        mid = None
+
     if mid:
         try:
-            await BOT.edit_message_text(chat_id=uid, message_id=mid, text=text, reply_markup=kb)
+            media = InputMediaPhoto(media=file, caption=caption)
+            await BOT.edit_message_media(chat_id=uid, message_id=mid, media=media, reply_markup=kb)
             return
         except Exception:
             room.status_msg_id.pop(uid, None)
 
     try:
-        msg = await BOT.send_message(uid, text, reply_markup=kb)
+        msg = await BOT.send_photo(chat_id=uid, photo=file, caption=caption, reply_markup=kb)
         room.status_msg_id[uid] = msg.message_id
     except Exception:
         pass
 
 
-async def refresh_room(room: Room):
+async def refresh_room(room: Room, bump: bool = False):
     for uid in list(room.players):
-        await upsert_status(room, uid)
+        await upsert_status(room, uid, force_new=bump)
 
 
 async def close_room(room: Room):
     global BOT
     if not BOT:
         return
-
     for uid in list(room.players):
         user_room.pop(uid, None)
         room.status_msg_id.pop(uid, None)
@@ -297,7 +311,6 @@ async def close_room(room: Room):
             await BOT.send_message(uid, "🧹 Комната закрыта.", reply_markup=kb_main())
         except Exception:
             pass
-
     rooms_by_code.pop(room.code, None)
 
 
@@ -307,6 +320,7 @@ def reset_game(room: Room):
     room.fails = 0
     room.turn_idx = 0
     room.last_move = ""
+    room.img_cache.clear()
 
 
 async def start_game(room: Room):
@@ -319,7 +333,7 @@ async def start_game(room: Room):
         return
 
     if len(room.order) < 1:
-        await BOT.send_message(room.host_id, "Нужен хотя бы 1 отгадывающий (кроме хоста). Пусть друг войдёт по коду.", reply_markup=kb_host_room())
+        await BOT.send_message(room.host_id, "Нужен хотя бы 1 отгадывающий (кроме хоста).", reply_markup=kb_host_room())
         await refresh_room(room)
         return
 
@@ -328,7 +342,7 @@ async def start_game(room: Room):
     await refresh_room(room)
 
 
-async def broadcast_finish(room: Room, text: str):
+async def broadcast_chat(room: Room, text: str):
     global BOT
     if not BOT:
         return
@@ -337,14 +351,25 @@ async def broadcast_finish(room: Room, text: str):
             await BOT.send_message(uid, text, reply_markup=ui_for(uid))
         except Exception:
             pass
+    # после чата "поднимаем" статус вниз, чтобы он был последним
+    await refresh_room(room, bump=True)
 
 
-# ===================== CORE COMMANDS =====================
+async def finish(room: Room, text: str):
+    room.started = False
+    room.last_move = text
+    await refresh_room(room)
+
+
+# ===================== COMMANDS / BUTTONS =====================
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
-    await message.answer(f"Привет, {tg_name(message)}! 🎮\nУправление — кнопками снизу.", reply_markup=ui_for(uid))
+    await message.answer(
+        f"Привет, {tg_name(message)}! 🎮\nУправление — кнопками снизу.",
+        reply_markup=ui_for(uid),
+    )
 
 
 @dp.message(Command("create"))
@@ -360,6 +385,7 @@ async def cmd_create(message: Message, state: FSMContext):
     room = Room(code=code, host_id=uid)
     room.players.add(uid)
     room.names[uid] = tg_name(message)
+    room.tags[uid] = tg_tag(message)
 
     rooms_by_code[code] = room
     user_room[uid] = code
@@ -383,6 +409,38 @@ async def cmd_join(message: Message, state: FSMContext):
     await message.answer("Введи код комнаты:", reply_markup=kb_main())
 
 
+@dp.message(JoinFlow.waiting_code, F.text)
+async def join_wait_code(message: Message, state: FSMContext):
+    code = (message.text or "").strip().upper()
+    await state.clear()
+    await join_by_code(message, code)
+
+
+async def join_by_code(message: Message, code: str):
+    uid = message.from_user.id
+
+    if get_room_by_user(uid):
+        await message.answer("Ты уже в комнате.", reply_markup=ui_for(uid))
+        return
+
+    room = rooms_by_code.get(code)
+    if not room:
+        await message.answer("Комната не найдена. Проверь код.", reply_markup=kb_main())
+        return
+
+    room.players.add(uid)
+    room.names[uid] = tg_name(message)
+    room.tags[uid] = tg_tag(message)
+    user_room[uid] = code
+
+    if uid != room.host_id and uid not in room.order:
+        room.order.append(uid)
+
+    room.last_move = f"{room.tags[uid]} вошёл(ла)"
+    await refresh_room(room)
+    await message.answer(f"✅ Ты вошёл(ла) в комнату {code}.", reply_markup=ui_for(uid))
+
+
 @dp.message(Command("leave"))
 async def cmd_leave(message: Message, state: FSMContext):
     await state.clear()
@@ -393,20 +451,26 @@ async def cmd_leave(message: Message, state: FSMContext):
         await message.answer("Ты не в комнате.", reply_markup=kb_main())
         return
 
-    # убрать
+    # remove
     user_room.pop(uid, None)
     room.players.discard(uid)
     room.status_msg_id.pop(uid, None)
 
     if uid in room.order:
+        was_turn = (room.order and current_turn_user(room) == uid)
         room.order.remove(uid)
-        room.turn_idx = room.turn_idx % max(1, len(room.order)) if room.order else 0
+        if room.order:
+            room.turn_idx = room.turn_idx % len(room.order)
+            if was_turn:
+                room.last_move = f"{room.tags.get(uid,'Игрок')} вышел(ла), ход передан дальше"
+        else:
+            room.turn_idx = 0
 
     if uid == room.host_id:
         await close_room(room)
         return
 
-    room.last_move = f"{tg_name(message)} вышел(ла)"
+    room.last_move = f"{room.tags.get(uid,'Игрок')} вышел(ла)"
     await refresh_room(room)
     await message.answer("👋 Ты вышел(ла) из комнаты.", reply_markup=kb_main())
 
@@ -454,54 +518,20 @@ async def cmd_restart(message: Message):
     await start_game(room)
 
 
-# ===================== JOIN FLOW =====================
-@dp.message(JoinFlow.waiting_code, F.text)
-async def join_wait_code(message: Message, state: FSMContext):
-    code = (message.text or "").strip().upper()
-    await state.clear()
-    await join_by_code(message, code)
-
-
-async def join_by_code(message: Message, code: str):
-    uid = message.from_user.id
-
-    if get_room_by_user(uid):
-        await message.answer("Ты уже в комнате. Нажми 🚪 Выйти из комнаты.", reply_markup=ui_for(uid))
-        return
-
-    room = rooms_by_code.get(code)
-    if not room:
-        await message.answer("Комната не найдена. Проверь код.", reply_markup=kb_main())
-        return
-
-    room.players.add(uid)
-    room.names[uid] = tg_name(message)
-    user_room[uid] = code
-
-    if uid != room.host_id and uid not in room.order:
-        room.order.append(uid)
-
-    room.last_move = f"{tg_name(message)} вошёл(ла)"
-    await refresh_room(room)
-    await message.answer(f"✅ Ты вошёл(ла) в комнату {code}.", reply_markup=ui_for(uid))
-
-
-# ===================== SETUP LIVES/WORD (важно: кнопки работают и тут!) =====================
+# ===================== SETUP (lives -> word) =====================
 @dp.message(HostSetup.waiting_lives, F.text)
 async def host_setup_lives(message: Message, state: FSMContext):
     txt = (message.text or "").strip()
 
-    # ВАЖНО: если нажали кнопку во время шага — обработаем
-    if txt == BTN_CLOSE:
-        await state.clear()
-        await cmd_close(message)
-        return
-    if txt == BTN_LEAVE:
-        await cmd_leave(message, state)
-        return
-    if txt == BTN_START:
-        await state.clear()
-        await cmd_startgame(message)
+    if txt in (BTN_CLOSE, BTN_LEAVE, BTN_START):
+        if txt == BTN_CLOSE:
+            await state.clear()
+            await cmd_close(message)
+        elif txt == BTN_LEAVE:
+            await cmd_leave(message, state)
+        else:
+            await state.clear()
+            await cmd_startgame(message)
         return
 
     uid = message.from_user.id
@@ -521,6 +551,7 @@ async def host_setup_lives(message: Message, state: FSMContext):
         return
 
     room.max_fails = n
+    room.img_cache.clear()
     room.last_move = f"Хост установил жизни: {n} ❤️"
     await refresh_room(room)
 
@@ -532,16 +563,15 @@ async def host_setup_lives(message: Message, state: FSMContext):
 async def host_setup_word(message: Message, state: FSMContext):
     txt = (message.text or "").strip()
 
-    if txt == BTN_CLOSE:
-        await state.clear()
-        await cmd_close(message)
-        return
-    if txt == BTN_LEAVE:
-        await cmd_leave(message, state)
-        return
-    if txt == BTN_START:
-        await state.clear()
-        await cmd_startgame(message)
+    if txt in (BTN_CLOSE, BTN_LEAVE, BTN_START):
+        if txt == BTN_CLOSE:
+            await state.clear()
+            await cmd_close(message)
+        elif txt == BTN_LEAVE:
+            await cmd_leave(message, state)
+        else:
+            await state.clear()
+            await cmd_startgame(message)
         return
 
     uid = message.from_user.id
@@ -553,7 +583,7 @@ async def host_setup_word(message: Message, state: FSMContext):
 
     w = normalize_word(txt)
     if len(w) < 2:
-        await message.answer("Слово не подходит (русские буквы, минимум 2). Введи другое слово:")
+        await message.answer("Слово не подходит. Введи другое слово:")
         return
 
     room.secret = w
@@ -561,17 +591,219 @@ async def host_setup_word(message: Message, state: FSMContext):
     room.guessed = set()
     room.fails = 0
     room.turn_idx = 0
+    room.img_cache.clear()
     room.last_move = "Хост задал слово 🪓"
-    await state.clear()
 
+    await state.clear()
     await refresh_room(room)
 
-    # автостарт если уже есть хотя бы 1 отгадывающий
     if len(room.order) >= 1:
         await start_game(room)
 
 
-# ===================== BUTTON HANDLERS =====================
+# ===================== KICK PLAYER =====================
+@dp.message(F.text == BTN_KICK)
+async def ui_kick(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    room = get_room_by_user(uid)
+    if not room or room.host_id != uid:
+        await message.answer("Только хост может удалять игроков.", reply_markup=ui_for(uid))
+        return
+
+    if not room.order:
+        await message.answer("Некого удалять (нет отгадывающих).", reply_markup=kb_host_room())
+        return
+
+    lines = ["Кого удалить? Ответь цифрой (или ❌ Отмена):\n"]
+    for i, pid in enumerate(room.order, start=1):
+        lines.append(f"{i}) {room.tags.get(pid, 'Игрок')}")
+    await state.set_state(KickFlow.waiting_index)
+    await message.answer("\n".join(lines), reply_markup=kb_cancel_only())
+
+
+@dp.message(KickFlow.waiting_index, F.text)
+async def kick_wait(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    room = get_room_by_user(uid)
+    txt = (message.text or "").strip()
+
+    if txt == BTN_CANCEL:
+        await state.clear()
+        await message.answer("Ок, отменено.", reply_markup=ui_for(uid))
+        return
+
+    if not room or room.host_id != uid:
+        await state.clear()
+        await message.answer("Не могу: ты не хост или комнаты нет.", reply_markup=kb_main())
+        return
+
+    if not txt.isdigit():
+        await message.answer("Нужно число из списка (или ❌ Отмена).", reply_markup=kb_cancel_only())
+        return
+
+    idx = int(txt)
+    if idx < 1 or idx > len(room.order):
+        await message.answer("Нет такого номера. Попробуй ещё раз.", reply_markup=kb_cancel_only())
+        return
+
+    kicked_id = room.order[idx - 1]
+    was_turn = (room.started and current_turn_user(room) == kicked_id)
+
+    room.players.discard(kicked_id)
+    user_room.pop(kicked_id, None)
+    room.status_msg_id.pop(kicked_id, None)
+
+    room.order.remove(kicked_id)
+    if room.order:
+        room.turn_idx = room.turn_idx % len(room.order)
+    else:
+        room.turn_idx = 0
+
+    await state.clear()
+
+    try:
+        await BOT.send_message(kicked_id, "👢 Тебя удалили из комнаты.", reply_markup=kb_main())
+    except Exception:
+        pass
+
+    room.last_move = f"Хост удалил {room.tags.get(kicked_id,'Игрок')} 👢"
+    if was_turn and room.order:
+        room.last_move += " (ход перешёл дальше)"
+    if room.started and not room.order:
+        room.started = False
+        room.last_move += " — игра остановлена (нет отгадывающих)."
+
+    await refresh_room(room)
+    await message.answer("Готово ✅", reply_markup=ui_for(uid))
+
+
+# ===================== TRANSFER HOST =====================
+@dp.message(F.text == BTN_TRANSFER)
+async def ui_transfer(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    room = get_room_by_user(uid)
+    if not room or room.host_id != uid:
+        await message.answer("Только хост может передавать хоста.", reply_markup=ui_for(uid))
+        return
+
+    candidates = [p for p in room.players if p != room.host_id]
+    if not candidates:
+        await message.answer("Некому передать хоста (ты один/одна в комнате).", reply_markup=kb_host_room())
+        return
+
+    # показываем только не-хоста (включая игроков, которые угадывают)
+    lines = ["Кому передать хоста? Ответь цифрой (или ❌ Отмена):\n"]
+    for i, pid in enumerate(candidates, start=1):
+        lines.append(f"{i}) {room.tags.get(pid, 'Игрок')}")
+    await state.set_state(TransferFlow.waiting_index)
+    await state.update_data(candidates=candidates)
+    await message.answer("\n".join(lines), reply_markup=kb_cancel_only())
+
+
+@dp.message(TransferFlow.waiting_index, F.text)
+async def transfer_wait(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    room = get_room_by_user(uid)
+    txt = (message.text or "").strip()
+
+    if txt == BTN_CANCEL:
+        await state.clear()
+        await message.answer("Ок, отменено.", reply_markup=ui_for(uid))
+        return
+
+    if not room or room.host_id != uid:
+        await state.clear()
+        await message.answer("Не могу: ты не хост или комнаты нет.", reply_markup=kb_main())
+        return
+
+    data = await state.get_data()
+    candidates = data.get("candidates", [])
+    if not txt.isdigit():
+        await message.answer("Нужно число из списка (или ❌ Отмена).", reply_markup=kb_cancel_only())
+        return
+
+    idx = int(txt)
+    if idx < 1 or idx > len(candidates):
+        await message.answer("Нет такого номера. Попробуй ещё раз.", reply_markup=kb_cancel_only())
+        return
+
+    new_host = candidates[idx - 1]
+    old_host = room.host_id
+
+    # сохраняем текущего ходящего
+    old_turn = current_turn_user(room)
+
+    # хост не должен угадывать: убираем new_host из очереди
+    if new_host in room.order:
+        room.order.remove(new_host)
+
+    # бывший хост становится обычным игроком-угадывающим (по умолчанию)
+    if old_host != new_host and old_host in room.players and old_host not in room.order:
+        room.order.append(old_host)
+
+    room.host_id = new_host
+
+    # поправим turn_idx, чтобы игра не ломалась
+    if room.order:
+        if old_turn in room.order:
+            room.turn_idx = room.order.index(old_turn)
+        else:
+            room.turn_idx = room.turn_idx % len(room.order)
+    else:
+        room.turn_idx = 0
+        if room.started:
+            room.started = False
+            room.last_move = "Хост сменился — игра остановлена (нет отгадывающих)."
+
+    await state.clear()
+
+    room.last_move = f"👑 Хост теперь {room.tags.get(new_host,'Игрок')}"
+    await refresh_room(room)
+    await broadcast_chat(room, f"👑 Хост передан: {room.tags.get(new_host,'Игрок')}")
+
+    await message.answer("Готово ✅", reply_markup=ui_for(new_host))
+
+
+# ===================== COMMENTS =====================
+@dp.message(F.text == BTN_COMMENT)
+async def ui_comment(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    room = get_room_by_user(uid)
+    if not room:
+        await message.answer("Ты не в комнате.", reply_markup=kb_main())
+        return
+    await state.set_state(CommentFlow.waiting_text)
+    await message.answer("Напиши комментарий (или ❌ Отмена):", reply_markup=kb_cancel_only())
+
+
+@dp.message(CommentFlow.waiting_text, F.text)
+async def comment_wait(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    room = get_room_by_user(uid)
+    txt = (message.text or "").strip()
+
+    if txt == BTN_CANCEL:
+        await state.clear()
+        await message.answer("Ок, отменено.", reply_markup=ui_for(uid))
+        return
+
+    if not room:
+        await state.clear()
+        await message.answer("Комнаты уже нет.", reply_markup=kb_main())
+        return
+
+    room.names[uid] = tg_name(message)
+    room.tags[uid] = tg_tag(message)
+
+    prefix = f"💬 {room.tags.get(uid,'Игрок')}: "
+    if uid == room.host_id:
+        prefix = f"💬 ХОСТ {room.tags.get(uid,'Игрок')}: "
+
+    await state.clear()
+    await broadcast_chat(room, prefix + txt)
+
+
+# ===================== BUTTON ROUTES =====================
 @dp.message(F.text == BTN_CREATE)
 async def ui_create(message: Message, state: FSMContext):
     await cmd_create(message, state)
@@ -606,7 +838,6 @@ async def ui_restart(message: Message):
 # ===================== GAME INPUT (буква/слово) =====================
 @dp.message(F.text)
 async def on_text(message: Message, state: FSMContext):
-    # если пользователь в FSM — не мешаем
     if await state.get_state() is not None:
         return
 
@@ -616,12 +847,13 @@ async def on_text(message: Message, state: FSMContext):
         return
 
     room.names[uid] = tg_name(message)
+    room.tags[uid] = tg_tag(message)
 
-    if not room.started:
+    if not room.started or not room.order:
         await refresh_room(room)
         return
 
-    if not room.order:
+    if uid == room.host_id:
         await refresh_room(room)
         return
 
@@ -630,24 +862,18 @@ async def on_text(message: Message, state: FSMContext):
         await refresh_room(room)
         return
 
-    if uid == room.host_id:
-        await refresh_room(room)
-        return
-
     txt = (message.text or "").strip().lower()
     if not txt:
         return
 
-    # буква
     if len(txt) == 1:
         ch = txt
         if ch not in ALLOWED:
-            room.last_move = f"{display_name(room, uid)} ввёл(ла) не-русскую букву ❌"
+            room.last_move = f"{room.tags.get(uid,'Игрок')} не-русская буква ❌"
             await refresh_room(room)
-            await message.answer("Пиши русскую букву (например: р, т, а).", reply_markup=ui_for(uid))
             return
         if ch in room.guessed:
-            room.last_move = f"{display_name(room, uid)} повторил(а) букву: {ch}"
+            room.last_move = f"{room.tags.get(uid,'Игрок')} повторил(а): {ch}"
             await refresh_room(room)
             return
 
@@ -655,22 +881,21 @@ async def on_text(message: Message, state: FSMContext):
         ok = ch in room.secret
         if not ok:
             room.fails += 1
-        room.last_move = f"{display_name(room, uid)}: {ch} ({'✅ есть' if ok else '❌ нет'})"
+        room.last_move = f"{room.tags.get(uid,'Игрок')}: {ch} ({'✅ есть' if ok else '❌ нет'})"
 
-    # слово
     else:
         guess = normalize_word(txt)
         if len(guess) < 2:
-            room.last_move = f"{display_name(room, uid)} ввёл(ла) некорректное слово ❌"
+            room.last_move = f"{room.tags.get(uid,'Игрок')} некорректное слово ❌"
             await refresh_room(room)
             return
 
         if guess == room.secret:
             room.guessed.update(set(room.secret))
-            room.last_move = f"{display_name(room, uid)} угадал(а) слово целиком ✅"
+            room.last_move = f"{room.tags.get(uid,'Игрок')} угадал(а) слово ✅"
         else:
             room.fails += 1
-            room.last_move = f"{display_name(room, uid)} попытка словом ❌"
+            room.last_move = f"{room.tags.get(uid,'Игрок')} попытка словом ❌"
 
     await refresh_room(room)
 
@@ -678,13 +903,13 @@ async def on_text(message: Message, state: FSMContext):
     lose = room.fails >= room.max_fails
 
     if win:
-        room.started = False
-        await broadcast_finish(room, f"🎉 Победа! Слово: {room.secret}\nХост: 🔄 Новая игра или 🪓 Новое слово.")
+        await finish(room, "🎉 Победа!")
+        await broadcast_chat(room, f"🎉 Победа! Слово: {room.secret}")
         return
 
     if lose:
-        room.started = False
-        await broadcast_finish(room, f"💀 Поражение. Слово было: {room.secret}\nХост: 🔄 Новая игра или 🪓 Новое слово.")
+        await finish(room, "💀 Поражение!")
+        await broadcast_chat(room, f"💀 Поражение. Слово было: {room.secret}")
         return
 
     room.turn_idx += 1
