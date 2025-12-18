@@ -5,6 +5,10 @@ import string
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Optional, Tuple
 
+import aiosqlite
+from aiohttp import web
+from PIL import Image, ImageDraw
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -14,9 +18,6 @@ from aiogram.types import (
     BufferedInputFile,
     InputMediaPhoto,
 )
-from aiohttp import web
-from PIL import Image, ImageDraw
-
 
 # ===================== SETTINGS =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -24,9 +25,11 @@ if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN (переменная окружения)")
 
 PORT = int(os.getenv("PORT", "8000"))
+DB_PATH = os.getenv("DB_PATH", "data.db")
 
 dp = Dispatcher()
 BOT: Optional[Bot] = None
+DB: Optional[aiosqlite.Connection] = None
 
 
 # ===================== BUTTON TEXTS =====================
@@ -48,10 +51,10 @@ BTN_CANCEL = "❌ Отмена"
 # ===================== UI KEYBOARDS =====================
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_CREATE), KeyboardButton(text=BTN_JOIN)],
-        ],
+        keyboard=[[KeyboardButton(text=BTN_CREATE), KeyboardButton(text=BTN_JOIN)]],
         resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выбери действие…",
     )
 
 
@@ -59,6 +62,8 @@ def kb_cancel() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=BTN_CANCEL)]],
         resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Введи значение или нажми Отмена…",
     )
 
 
@@ -69,6 +74,7 @@ def kb_player_room() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_LEAVE)],
         ],
         resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -88,7 +94,11 @@ def kb_host_room(started: bool) -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_CLOSE)],
             [KeyboardButton(text=BTN_LEAVE)],
         ]
-    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 # ===================== GAME DATA =====================
@@ -130,10 +140,9 @@ class Room:
     guessed: Set[str] = field(default_factory=set)
     fails: int = 0
     turn_idx: int = 0
-
     last_move: str = ""
 
-    # статус-сообщения (чтобы лечить дубли)
+    # статус-сообщения в ЛС (НЕ пишем в DB, восстановим по взаимодействию)
     status_msg_ids: Dict[int, List[int]] = field(default_factory=dict)
 
     # кэш картинок
@@ -143,8 +152,162 @@ class Room:
 rooms_by_code: Dict[str, Room] = {}
 user_room: Dict[int, str] = {}
 
-# pending[uid] = ("join"|"lives"|"word"|"kick"|"transfer"|"comment", room_code)
+# pending[uid] = ("join"|"lives"|"word"|"kick"|"transfer"|"comment", room_code or None)
 pending: Dict[int, Tuple[str, Optional[str]]] = {}
+
+
+# ===================== DB HELPERS =====================
+async def db_exec(sql: str, params: Tuple = ()):
+    assert DB is not None
+    await DB.execute(sql, params)
+    await DB.commit()
+
+
+async def db_fetchall(sql: str, params: Tuple = ()) -> List[aiosqlite.Row]:
+    assert DB is not None
+    DB.row_factory = aiosqlite.Row
+    async with DB.execute(sql, params) as cur:
+        return await cur.fetchall()
+
+
+async def db_fetchone(sql: str, params: Tuple = ()) -> Optional[aiosqlite.Row]:
+    assert DB is not None
+    DB.row_factory = aiosqlite.Row
+    async with DB.execute(sql, params) as cur:
+        return await cur.fetchone()
+
+
+async def db_init():
+    global DB
+    DB = await aiosqlite.connect(DB_PATH)
+    await db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS rooms (
+            code TEXT PRIMARY KEY,
+            host_id INTEGER NOT NULL,
+            started INTEGER NOT NULL,
+            max_fails INTEGER NOT NULL,
+            secret TEXT NOT NULL,
+            guessed TEXT NOT NULL,
+            fails INTEGER NOT NULL,
+            turn_idx INTEGER NOT NULL,
+            last_move TEXT NOT NULL
+        )
+        """
+    )
+    await db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS players (
+            room_code TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            is_guesser INTEGER NOT NULL,
+            order_idx INTEGER NOT NULL,
+            PRIMARY KEY (room_code, user_id)
+        )
+        """
+    )
+
+
+async def room_to_db(room: Room):
+    guessed_str = "".join(sorted(room.guessed))
+    await db_exec(
+        """
+        INSERT INTO rooms(code, host_id, started, max_fails, secret, guessed, fails, turn_idx, last_move)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(code) DO UPDATE SET
+            host_id=excluded.host_id,
+            started=excluded.started,
+            max_fails=excluded.max_fails,
+            secret=excluded.secret,
+            guessed=excluded.guessed,
+            fails=excluded.fails,
+            turn_idx=excluded.turn_idx,
+            last_move=excluded.last_move
+        """,
+        (
+            room.code,
+            room.host_id,
+            1 if room.started else 0,
+            room.max_fails,
+            room.secret,
+            guessed_str,
+            room.fails,
+            room.turn_idx,
+            room.last_move,
+        ),
+    )
+
+    # players: перезапишем по факту
+    await db_exec("DELETE FROM players WHERE room_code=?", (room.code,))
+    for uid in room.players:
+        name = room.names.get(uid, "Игрок")
+        tag = room.tags.get(uid, name)
+        is_guesser = 1 if (uid in room.order) else 0
+        order_idx = room.order.index(uid) if uid in room.order else -1
+        await db_exec(
+            """
+            INSERT INTO players(room_code, user_id, name, tag, is_guesser, order_idx)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (room.code, uid, name, tag, is_guesser, order_idx),
+        )
+
+
+async def delete_room_db(code: str):
+    await db_exec("DELETE FROM players WHERE room_code=?", (code,))
+    await db_exec("DELETE FROM rooms WHERE code=?", (code,))
+
+
+async def load_from_db():
+    rooms_by_code.clear()
+    user_room.clear()
+
+    rows = await db_fetchall("SELECT * FROM rooms")
+    for r in rows:
+        room = Room(
+            code=r["code"],
+            host_id=r["host_id"],
+            started=bool(r["started"]),
+            max_fails=r["max_fails"],
+            secret=r["secret"],
+            guessed=set(r["guessed"] or ""),
+            fails=r["fails"],
+            turn_idx=r["turn_idx"],
+            last_move=r["last_move"],
+        )
+        rooms_by_code[room.code] = room
+
+    prow = await db_fetchall("SELECT * FROM players")
+    for p in prow:
+        code = p["room_code"]
+        room = rooms_by_code.get(code)
+        if not room:
+            continue
+        uid = p["user_id"]
+        room.players.add(uid)
+        room.names[uid] = p["name"]
+        room.tags[uid] = p["tag"]
+        if p["is_guesser"] == 1 and uid != room.host_id:
+            room.order.append(uid)
+        user_room[uid] = code
+
+    # порядок guesser'ов восстановим по order_idx
+    for room in rooms_by_code.values():
+        guessers = await db_fetchall(
+            "SELECT user_id, order_idx FROM players WHERE room_code=? AND is_guesser=1 ORDER BY order_idx ASC",
+            (room.code,),
+        )
+        room.order = [row["user_id"] for row in guessers if row["user_id"] != room.host_id]
+        if room.order:
+            room.turn_idx = room.turn_idx % len(room.order)
+        else:
+            room.turn_idx = 0
+            if room.started:
+                room.started = False
+                room.last_move = "Игра остановлена (нет отгадывающих)."
+        room.img_cache.clear()
 
 
 # ===================== HELPERS =====================
@@ -203,7 +366,6 @@ def _draw_hangman_png(stage: int) -> bytes:
     img = Image.new("RGB", (W, H), "white")
     d = ImageDraw.Draw(img)
 
-    # виселица
     d.line((80, 380, 320, 380), fill="black", width=6)
     d.line((140, 380, 140, 70), fill="black", width=8)
     d.line((140, 70, 360, 70), fill="black", width=8)
@@ -244,7 +406,7 @@ def hangman_image(room: Room) -> bytes:
     return data
 
 
-# ===================== STATUS MESSAGE (STRICT ONE) =====================
+# ===================== STATUS (STRICT ONE) =====================
 async def upsert_status(room: Room, uid: int):
     global BOT
     if not BOT:
@@ -254,7 +416,6 @@ async def upsert_status(room: Room, uid: int):
     kb = ui_for(uid)
     ids = room.status_msg_ids.get(uid, [])
 
-    # удалить лишние дубли (оставить последнее)
     if len(ids) > 1:
         for mid in ids[:-1]:
             try:
@@ -274,7 +435,6 @@ async def upsert_status(room: Room, uid: int):
             await BOT.edit_message_media(chat_id=uid, message_id=mid, media=media, reply_markup=kb)
             return
         except Exception:
-            # если редактирование не получилось — пробуем удалить старое
             try:
                 await BOT.delete_message(chat_id=uid, message_id=mid)
             except Exception:
@@ -289,6 +449,7 @@ async def upsert_status(room: Room, uid: int):
 
 
 async def refresh_room(room: Room):
+    await room_to_db(room)
     for uid in list(room.players):
         await upsert_status(room, uid)
 
@@ -297,12 +458,14 @@ async def broadcast_chat(room: Room, text: str):
     global BOT
     if not BOT:
         return
+    await room_to_db(room)
     for uid in list(room.players):
         try:
             await BOT.send_message(uid, text, reply_markup=ui_for(uid))
         except Exception:
             pass
-    await refresh_room(room)
+    for uid in list(room.players):
+        await upsert_status(room, uid)
 
 
 def reset_game(room: Room):
@@ -324,6 +487,7 @@ async def close_room(room: Room):
     global BOT
     if not BOT:
         return
+
     for uid in list(room.players):
         user_room.pop(uid, None)
         pending.pop(uid, None)
@@ -337,6 +501,8 @@ async def close_room(room: Room):
             await BOT.send_message(uid, "🧹 Комната закрыта.", reply_markup=kb_main())
         except Exception:
             pass
+
+    await delete_room_db(room.code)
     rooms_by_code.pop(room.code, None)
 
 
@@ -359,7 +525,7 @@ async def start_game(room: Room):
     await refresh_room(room)
 
 
-# ===================== GLOBAL CANCEL / LEAVE (NO FSM) =====================
+# ===================== GLOBAL CANCEL / LEAVE =====================
 @dp.message(F.text == BTN_CANCEL)
 async def hard_cancel(message: Message):
     uid = message.from_user.id
@@ -377,7 +543,6 @@ async def hard_leave(message: Message):
         await message.answer("Ты не в комнате.", reply_markup=kb_main())
         return
 
-    # удалить статус-сообщения (если можем)
     mids = room.status_msg_ids.pop(uid, [])
     for mid in mids:
         try:
@@ -410,7 +575,7 @@ async def hard_leave(message: Message):
     await message.answer("👋 Ты вышел(ла) из комнаты.", reply_markup=kb_main())
 
 
-# ===================== START / MAIN MENU =====================
+# ===================== START / MAIN =====================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     uid = message.from_user.id
@@ -436,7 +601,6 @@ async def ui_create(message: Message):
     rooms_by_code[code] = room
     user_room[uid] = code
 
-    # шаг 1: ждём жизни
     pending[uid] = ("lives", code)
 
     await message.answer(
@@ -496,13 +660,9 @@ async def ui_restart(message: Message):
     if room.host_id != uid:
         await message.answer("Только хост может начать новую игру.", reply_markup=ui_for(uid))
         return
-    if not room.secret:
-        pending[uid] = ("word", room.code)
-        await message.answer("Сначала введи слово (русские буквы):", reply_markup=kb_cancel())
-        return
 
-    room.last_move = "Хост: новая игра 🔄"
-    await start_game(room)
+    pending[uid] = ("word", room.code)
+    await message.answer("Введи новое слово (русские буквы) или ❌ Отмена:", reply_markup=kb_cancel())
 
 
 @dp.message(F.text == BTN_KICK)
@@ -536,7 +696,6 @@ async def ui_transfer(message: Message):
         await message.answer("Некому передать хоста (ты один/одна).", reply_markup=ui_for(uid))
         return
 
-    # сохраним кандидатов в room.temp прямо в pending через код + "transfer"
     room._transfer_candidates = candidates  # type: ignore
 
     lines = ["Кому передать хоста? Ответь цифрой (или ❌ Отмена):\n"]
@@ -557,23 +716,21 @@ async def ui_comment(message: Message):
     await message.answer("Напиши комментарий (или ❌ Отмена):", reply_markup=kb_cancel())
 
 
-# ===================== MAIN TEXT ROUTER (NO FSM) =====================
+# ===================== TEXT ROUTER =====================
 @dp.message(F.text)
 async def on_text(message: Message):
     uid = message.from_user.id
     txt_raw = (message.text or "").strip()
 
-    # обновим имя/ник в комнате, если есть
     room_now = get_room_by_user(uid)
     if room_now:
         room_now.names[uid] = tg_name(message)
         room_now.tags[uid] = tg_tag(message)
 
-    # 1) если ждём какой-то ввод — обработать
+    # pending mode
     if uid in pending:
         mode, code = pending[uid]
 
-        # JOIN
         if mode == "join":
             code_in = txt_raw.upper()
             pending.pop(uid, None)
@@ -600,7 +757,6 @@ async def on_text(message: Message):
             await message.answer(f"✅ Ты вошёл(ла) в комнату {room.code}.", reply_markup=ui_for(uid))
             return
 
-        # LIVES
         if mode == "lives":
             room = rooms_by_code.get(code or "")
             if not room or room.host_id != uid:
@@ -626,7 +782,6 @@ async def on_text(message: Message):
             await message.answer("✅ Жизни установлены.\nШаг 2/2: введи слово (русские буквы):", reply_markup=kb_cancel())
             return
 
-        # WORD
         if mode == "word":
             room = rooms_by_code.get(code or "")
             if not room or room.host_id != uid:
@@ -656,7 +811,6 @@ async def on_text(message: Message):
                 await message.answer("✅ Слово задано. Ждём игроков по коду…", reply_markup=ui_for(uid))
             return
 
-        # KICK
         if mode == "kick":
             room = rooms_by_code.get(code or "")
             if not room or room.host_id != uid:
@@ -675,10 +829,8 @@ async def on_text(message: Message):
 
             kicked_id = room.order[idx - 1]
             was_turn = (room.started and current_turn_user(room) == kicked_id)
-
             pending.pop(uid, None)
 
-            # удалить статус кикнутого
             mids = room.status_msg_ids.pop(kicked_id, [])
             for mid in mids:
                 try:
@@ -713,7 +865,6 @@ async def on_text(message: Message):
             await message.answer("Готово ✅", reply_markup=ui_for(uid))
             return
 
-        # TRANSFER
         if mode == "transfer":
             room = rooms_by_code.get(code or "")
             if not room or room.host_id != uid:
@@ -739,12 +890,10 @@ async def on_text(message: Message):
             new_host = candidates[idx - 1]
             old_host = room.host_id
             old_turn = current_turn_user(room)
-
             pending.pop(uid, None)
 
             if new_host in room.order:
                 room.order.remove(new_host)
-
             if old_host in room.players and old_host not in room.order and old_host != new_host:
                 room.order.append(old_host)
 
@@ -766,14 +915,12 @@ async def on_text(message: Message):
             await broadcast_chat(room, f"👑 Хост передан: {room.tags.get(new_host,'Игрок')}")
             return
 
-        # COMMENT
         if mode == "comment":
             room = rooms_by_code.get(code or "")
             if not room:
                 pending.pop(uid, None)
                 await message.answer("Комнаты уже нет.", reply_markup=kb_main())
                 return
-
             pending.pop(uid, None)
 
             prefix = f"💬 {room.tags.get(uid,'Игрок')}: "
@@ -783,10 +930,9 @@ async def on_text(message: Message):
             await broadcast_chat(room, prefix + txt_raw)
             return
 
-        # если что-то странное
         pending.pop(uid, None)
 
-    # 2) обычный режим: либо ход, либо игнор
+    # normal gameplay
     room = get_room_by_user(uid)
     if not room:
         return
@@ -857,7 +1003,7 @@ async def on_text(message: Message):
     await refresh_room(room)
 
 
-# ===================== HEALTHCHECK (Koyeb) =====================
+# ===================== HEALTHCHECK =====================
 async def health(request: web.Request):
     return web.Response(text="ok")
 
@@ -875,8 +1021,11 @@ async def main():
     global BOT
     BOT = Bot(BOT_TOKEN)
 
-    # убрать боковое меню /команд
+    # убрать боковое /команд-меню
     await BOT.set_my_commands([])
+
+    await db_init()
+    await load_from_db()
 
     await run_http_server()
     await dp.start_polling(BOT)
