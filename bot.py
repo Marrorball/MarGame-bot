@@ -153,7 +153,7 @@ class Room:
     fails: int = 0
     turn_idx: int = 0
 
-    status_msg_id: Dict[int, int] = field(default_factory=dict)  # uid -> message_id
+    status_msg_ids: Dict[int, List[int]] = field(default_factory=dict)  # uid -> list of message_ids
     last_move: str = ""
 
     img_cache: Dict[Tuple[int, int], bytes] = field(default_factory=dict)
@@ -259,45 +259,62 @@ def hangman_image(room: Room) -> bytes:
 
 
 # ===================== STATUS MESSAGE (ONE, BUT CAN "BUMP") =====================
-async def upsert_status(room: Room, uid: int, force_new: bool = False):
+async def upsert_status(room: Room, uid: int, bump: bool = False):
     global BOT
     if not BOT:
         return
 
     caption = game_status_text(room)
     kb = ui_for(uid)
-    mid = room.status_msg_id.get(uid)
+
+    ids = room.status_msg_ids.get(uid, [])
 
     png = hangman_image(room)
     file = BufferedInputFile(png, filename="hangman.png")
 
-    # чтобы статус был последним: удаляем старый и шлём новый
-    if force_new and mid:
+    # ВАЖНО:
+    # - при ходах bump=False: редактируем ПОСЛЕДНЕЕ сообщение статуса
+    # - после комментария bump=True: хотим “поднять вниз”, но гарантировать 1 статус:
+    #   удаляем все старые статусы и отправляем новый
+
+    if bump:
+        # удалить все старые статусы
+        for mid in ids:
+            try:
+                await BOT.delete_message(chat_id=uid, message_id=mid)
+            except Exception:
+                pass
+        room.status_msg_ids[uid] = []
+
+        # отправить новый (единственный)
         try:
-            await BOT.delete_message(chat_id=uid, message_id=mid)
+            msg = await BOT.send_photo(chat_id=uid, photo=file, caption=caption, reply_markup=kb)
+            room.status_msg_ids[uid] = [msg.message_id]
         except Exception:
             pass
-        room.status_msg_id.pop(uid, None)
-        mid = None
+        return
 
-    if mid:
+    # bump=False: пытаемся редактировать последний
+    if ids:
+        mid = ids[-1]
         try:
             media = InputMediaPhoto(media=file, caption=caption)
             await BOT.edit_message_media(chat_id=uid, message_id=mid, media=media, reply_markup=kb)
             return
         except Exception:
-            room.status_msg_id.pop(uid, None)
+            # если не получилось — пробуем создать новый и заменить список на [new]
+            room.status_msg_ids[uid] = []
 
     try:
         msg = await BOT.send_photo(chat_id=uid, photo=file, caption=caption, reply_markup=kb)
-        room.status_msg_id[uid] = msg.message_id
+        room.status_msg_ids[uid] = [msg.message_id]
     except Exception:
         pass
 
 
 async def refresh_room(room: Room, bump: bool = False):
     for uid in list(room.players):
-        await upsert_status(room, uid, force_new=bump)
+        await upsert_status(room, uid, bump=bump)
 
 
 async def close_room(room: Room):
